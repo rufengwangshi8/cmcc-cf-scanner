@@ -1,9 +1,11 @@
 package com.cmcc.cfscanner
 
-import java.io.BufferedReader
-import java.io.InputStreamReader
+import java.io.BufferedInputStream
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import java.net.InetSocketAddress
 import java.net.URL
+import java.util.zip.GZIPInputStream
 import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLParameters
@@ -19,6 +21,12 @@ data class ScanResult(
     val isSpecial: Boolean,
     var speedMbps: Double? = null
 )
+
+/** 单次探测的完整结果：成功带 trace 出口 IP，失败带简短原因。 */
+sealed class ProbeOutcome {
+    data class Success(val result: ScanResult) : ProbeOutcome()
+    data class Failure(val reason: String) : ProbeOutcome()
+}
 
 /**
  * 移动特殊线路扫描器。
@@ -37,6 +45,8 @@ object Scanner {
 
     private const val CONNECT_TIMEOUT_MS = 1200
     private const val READ_TIMEOUT_MS = 3000
+    private const val TOTAL_TIMEOUT_MS = 3000
+    private const val MAX_BODY_BYTES = 64 * 1024
 
     /** 当前网络的出口 IP：通过 Cloudflare trace 正常解析得到。 */
     fun fetchBaseline(): String {
@@ -58,7 +68,13 @@ object Scanner {
         return out
     }
 
-    /** 在网段内随机抽取 count 个不重复的 IP。 */
+    /**
+     * 在全部网段里全局均匀随机抽取 count 个不重复的 IP。
+     * 和 Python 脚本的 SystemRandom().sample(range(total), n) 同一个做法：
+     * 先在“所有地址拼起来的总空间”里抽下标，再映射回 IP。
+     * 注意不能“先随机挑一个网段、再在段内挑 IP”，那样小网段会被严重高估
+     * （比如一个 /22 只有 1024 个地址，却和 52 万地址的 /13 抽到同样多的次数）。
+     */
     fun sampleIps(ranges: List<Pair<Long, Long>>, count: Int): List<String> {
         val total = ranges.sumOf { it.second - it.first + 1 }
         val want = minOf(count.toLong(), total).toInt()
@@ -66,20 +82,40 @@ object Scanner {
         var guard = 0
         while (picked.size < want && guard < want * 20) {
             guard++
-            val range = ranges[Random.nextInt(ranges.size)]
-            val size = range.second - range.first + 1
-            picked.add(range.first + Random.nextLong(size))
+            picked.add(Random.nextLong(total))
         }
-        return picked.map { longToIp(it) }
+        // 把全局下标按网段边界映射回 IP
+        val sorted = picked.sorted()
+        val out = ArrayList<String>(sorted.size)
+        var rangeIdx = 0
+        var offset = 0L
+        for (idx in sorted) {
+            while (rangeIdx < ranges.size - 1) {
+                val size = ranges[rangeIdx].second - ranges[rangeIdx].first + 1
+                if (idx < offset + size) break
+                offset += size
+                rangeIdx++
+            }
+            out.add(longToIp(ranges[rangeIdx].first + (idx - offset)))
+        }
+        return out
     }
 
     /**
      * 直连候选 IP 的 443 端口（SNI 为 speed.cloudflare.com），取 /cdn-cgi/trace。
      * 如果 Cloudflare 看到的出口 IP 和基准不同，就是特殊线路候选。
-     * 失败返回 null（这个 IP 直接跳过，不会让 App 崩溃）。
+     *
+     * 请求头和响应解析和 Python 脚本（cmcc_cf_special_route_scan.py）完全一致：
+     * 显式发 Accept: text/plain 和 Accept-Encoding: identity，避免服务端返回
+     * gzip 压缩的正文；按 HTTP 语义解析响应头、处理 chunked 分块和 gzip 解压，
+     * 再从正文里取 ip= 字段。任何一步失败都返回 Failure（带原因），不再静默丢弃，
+     * 这样界面能分清“没有特殊线路”和“探测本身失败了”。
+     * 单次探测总超时 3 秒，和脚本的 timeout=3.0 一致；TCP 连接超时 1.2 秒，
+     * 和脚本的 connect_timeout=1.2 一致。
      */
-    fun probe(ip: String, baseline: String): ScanResult? {
+    fun probe(ip: String, baseline: String): ProbeOutcome {
         val start = System.currentTimeMillis()
+        val deadline = start + TOTAL_TIMEOUT_MS
         var socket: SSLSocket? = null
         try {
             socket = openTls(ip, TRACE_HOST, CONNECT_TIMEOUT_MS, READ_TIMEOUT_MS)
@@ -87,27 +123,143 @@ object Scanner {
             val req = "GET $TRACE_PATH HTTP/1.1\r\n" +
                 "Host: $TRACE_HOST\r\n" +
                 "User-Agent: $USER_AGENT\r\n" +
+                "Accept: text/plain\r\n" +
+                "Accept-Encoding: identity\r\n" +
                 "Connection: close\r\n\r\n"
             out.write(req.toByteArray(Charsets.UTF_8))
             out.flush()
-            val reader = BufferedReader(InputStreamReader(socket.inputStream, Charsets.UTF_8))
-            var egress: String? = null
-            val deadline = System.currentTimeMillis() + READ_TIMEOUT_MS
-            while (System.currentTimeMillis() < deadline) {
-                val line = try { reader.readLine() } catch (e: Exception) { break } ?: break
-                if (line.startsWith("ip=")) {
-                    egress = line.substring(3).trim()
-                    break
-                }
-            }
+            val (status, _, body) = readHttpResponse(BufferedInputStream(socket.inputStream), deadline)
+            if (status != 200) return ProbeOutcome.Failure("HTTP $status")
+            val egress = parseTraceIp(body)
+                ?: return ProbeOutcome.Failure("trace 里没有 ip")
             val latency = System.currentTimeMillis() - start
-            if (egress.isNullOrEmpty()) return null
-            return ScanResult(ip, latency, egress, egress != baseline)
+            return ProbeOutcome.Success(ScanResult(ip, latency, egress, egress != baseline))
         } catch (e: Exception) {
-            return null
+            return ProbeOutcome.Failure(shortReason(e))
         } finally {
             try { socket?.close() } catch (e: Exception) { /* ignore */ }
         }
+    }
+
+    /** 从 trace 正文里取 ip= 字段。 */
+    private fun parseTraceIp(body: ByteArray): String? {
+        for (line in body.toString(Charsets.UTF_8).lines()) {
+            if (line.startsWith("ip=")) {
+                val value = line.substring(3).trim()
+                if (value.isNotEmpty()) return value
+            }
+        }
+        return null
+    }
+
+    /** 失败原因缩短到一行，方便界面汇总。 */
+    private fun shortReason(e: Exception): String {
+        val msg = e.message?.replace('\n', ' ')?.replace('\r', ' ')?.trim()?.take(60)
+        return if (msg.isNullOrEmpty()) e.javaClass.simpleName else "${e.javaClass.simpleName}: $msg"
+    }
+
+    /** 读完一个完整的 HTTP 响应：返回 (状态码, 响应头, 解码后的正文)。 */
+    private fun readHttpResponse(input: BufferedInputStream, deadline: Long): Triple<Int, Map<String, String>, ByteArray> {
+        val statusLine = readLineBytes(input)?.toString(Charsets.ISO_8859_1)
+            ?: throw IllegalStateException("响应为空")
+        val status = statusLine.split(" ").getOrNull(1)?.toIntOrNull()
+            ?: throw IllegalStateException("无效状态行")
+        val headers = mutableMapOf<String, String>()
+        while (true) {
+            val line = readLineBytes(input)?.toString(Charsets.ISO_8859_1)
+                ?: throw IllegalStateException("响应头不完整")
+            if (line.isEmpty()) break
+            val colon = line.indexOf(':')
+            if (colon > 0) {
+                headers[line.substring(0, colon).trim().lowercase()] = line.substring(colon + 1).trim()
+            }
+        }
+        val rawBody: ByteArray = when {
+            headers["transfer-encoding"]?.lowercase()?.contains("chunked") == true ->
+                readChunkedBody(input, deadline)
+            headers["content-length"] != null -> {
+                val length = headers["content-length"]!!.toIntOrNull()
+                    ?: throw IllegalStateException("Content-Length 无效")
+                if (length < 0 || length > MAX_BODY_BYTES) throw IllegalStateException("响应正文超限")
+                readExact(input, length, deadline)
+            }
+            else -> readUntilClose(input, deadline)
+        }
+        val body = if (headers["content-encoding"]?.lowercase()?.contains("gzip") == true) {
+            GZIPInputStream(rawBody.inputStream()).readBytes()
+        } else {
+            rawBody
+        }
+        return Triple(status, headers, body)
+    }
+
+    /** 从流里读一行（以 \n 结尾，去掉结尾的 \r\n）；EOF 返回 null。 */
+    private fun readLineBytes(input: BufferedInputStream): ByteArray? {
+        val buf = ByteArrayOutputStream()
+        while (true) {
+            val b = input.read()
+            if (b < 0) return if (buf.size() == 0) null else buf.toByteArray()
+            if (b == '\n'.code) break
+            buf.write(b)
+        }
+        val bytes = buf.toByteArray()
+        val len = bytes.size
+        return if (len > 0 && bytes[len - 1] == '\r'.code.toByte()) bytes.copyOf(len - 1) else bytes
+    }
+
+    /** 按 chunked 分块编码读正文。 */
+    private fun readChunkedBody(input: BufferedInputStream, deadline: Long): ByteArray {
+        val out = ByteArrayOutputStream()
+        while (true) {
+            if (System.currentTimeMillis() > deadline) throw IllegalStateException("读响应超时")
+            val sizeLine = readLineBytes(input)?.toString(Charsets.ISO_8859_1)
+                ?: throw IllegalStateException("chunked 响应提前结束")
+            val size = sizeLine.trim().split(";", limit = 2)[0].toIntOrNull(16)
+                ?: throw IllegalStateException("chunk 长度无效")
+            if (size == 0) {
+                while (true) {
+                    val trailer = readLineBytes(input) ?: break
+                    if (trailer.isEmpty()) break
+                }
+                return out.toByteArray()
+            }
+            if (out.size() + size > MAX_BODY_BYTES) throw IllegalStateException("响应正文超限")
+            out.write(readExact(input, size, deadline))
+            val crlf = readExact(input, 2, deadline)
+            if (crlf[0] != '\r'.code.toByte() || crlf[1] != '\n'.code.toByte()) {
+                throw IllegalStateException("chunk 格式错误")
+            }
+        }
+    }
+
+    /** 精确读 length 个字节，不够就抛错。 */
+    private fun readExact(input: BufferedInputStream, length: Int, deadline: Long): ByteArray {
+        val buf = ByteArray(length)
+        var off = 0
+        while (off < length) {
+            if (System.currentTimeMillis() > deadline) throw IllegalStateException("读响应超时")
+            val n = input.read(buf, off, length - off)
+            if (n < 0) throw IllegalStateException("响应提前结束")
+            off += n
+        }
+        return buf
+    }
+
+    /** 没有长度信息时读到连接关闭或超时为止。 */
+    private fun readUntilClose(input: BufferedInputStream, deadline: Long): ByteArray {
+        val out = ByteArrayOutputStream()
+        val buf = ByteArray(8192)
+        while (System.currentTimeMillis() < deadline) {
+            val n = try {
+                input.read(buf)
+            } catch (e: java.net.SocketTimeoutException) {
+                break
+            }
+            if (n < 0) break
+            out.write(buf, 0, n)
+            if (out.size() > MAX_BODY_BYTES) throw IllegalStateException("响应正文超限")
+        }
+        return out.toByteArray()
     }
 
     /** 通过候选 IP 下载测速（默认 10 秒），返回 MB/s；失败返回 null。 */

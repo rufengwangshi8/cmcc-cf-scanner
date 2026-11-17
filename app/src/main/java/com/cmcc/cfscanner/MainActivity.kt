@@ -83,6 +83,10 @@ class MainActivity : AppCompatActivity() {
                 val ranges = withContext(Dispatchers.IO) { Scanner.fetchRanges() }
                 val ips = Scanner.sampleIps(ranges, count)
                 val found = mutableListOf<ScanResult>()
+                var probedOk = 0
+                var probedFailed = 0
+                val failureReasons = mutableMapOf<String, Int>()
+                val egressSeen = LinkedHashSet<String>()
                 var done = 0
                 progressBar.isIndeterminate = false
                 progressBar.max = ips.size
@@ -90,8 +94,19 @@ class MainActivity : AppCompatActivity() {
                     val probed = chunk.map { ip ->
                         async(Dispatchers.IO) { Scanner.probe(ip, baseline) }
                     }.awaitAll()
-                    for (r in probed) {
-                        if (r != null && r.isSpecial) found.add(r)
+                    for (outcome in probed) {
+                        when (outcome) {
+                            is ProbeOutcome.Success -> {
+                                probedOk++
+                                if (egressSeen.size < 5) egressSeen.add(outcome.result.egressIp)
+                                if (outcome.result.isSpecial) found.add(outcome.result)
+                            }
+                            is ProbeOutcome.Failure -> {
+                                probedFailed++
+                                failureReasons[outcome.reason] =
+                                    (failureReasons[outcome.reason] ?: 0) + 1
+                            }
+                        }
                     }
                     done += chunk.size
                     progressBar.progress = done
@@ -111,6 +126,15 @@ class MainActivity : AppCompatActivity() {
                         if (!isActive) return@launch
                     }
                 }
+                // 扫描结束再确认一次基准出口（Python 脚本 BaselineGuard 的轻量版）：
+                // 如果扫描期间出口 IP 变了，本次结果不可信。
+                var baselineChanged = false
+                try {
+                    val baselineAfter = withContext(Dispatchers.IO) { Scanner.fetchBaseline() }
+                    baselineChanged = baselineAfter != baseline
+                } catch (e: Exception) {
+                    // 复查失败不影响已出结果
+                }
                 found.sortWith(
                     compareByDescending<ScanResult> { it.speedMbps ?: -1.0 }
                         .thenBy { it.latencyMs }
@@ -118,10 +142,23 @@ class MainActivity : AppCompatActivity() {
                 results.clear()
                 results.addAll(found)
                 adapter.submitList(results.toList())
+                // 诊断信息：分清“这批里确实没有特殊线路”和“探测本身失败了”。
+                // 成功数接近扫描数、且出口 IP 只有一个，说明是真没有；
+                // 失败数很大，说明探测没跑通，要先修网络/探测问题。
+                val diag = buildString {
+                    append("探测成功 $probedOk 个，失败 $probedFailed 个")
+                    if (egressSeen.isNotEmpty()) {
+                        append("\n见过的出口 IP：")
+                        append(egressSeen.joinToString("、"))
+                    }
+                    val topReason = failureReasons.maxByOrNull { it.value }?.key
+                    if (topReason != null) append("\n失败原因多为：$topReason")
+                    if (baselineChanged) append("\n注意：扫描期间基准出口 IP 变了，本次结果可能不准")
+                }
                 statusText.text = if (found.isEmpty()) {
-                    "没有发现特殊线路 IP，换个时间再试一次"
+                    "没有发现特殊线路 IP，换个时间再试一次\n$diag"
                 } else {
-                    "完成：发现 ${found.size} 个特殊线路 IP，按下载速度排序"
+                    "完成：发现 ${found.size} 个特殊线路 IP，按下载速度排序\n$diag"
                 }
                 if (found.isNotEmpty()) copyAllButton.visibility = View.VISIBLE
             } catch (e: CancellationException) {
