@@ -46,6 +46,7 @@ object Scanner {
     private const val CONNECT_TIMEOUT_MS = 1200
     private const val READ_TIMEOUT_MS = 3000
     private const val TOTAL_TIMEOUT_MS = 3000
+    private const val RETRY_DELAY_MS = 300L
     private const val MAX_BODY_BYTES = 64 * 1024
 
     /** 当前网络的出口 IP：通过 Cloudflare trace 正常解析得到。 */
@@ -112,8 +113,23 @@ object Scanner {
      * 这样界面能分清“没有特殊线路”和“探测本身失败了”。
      * 单次探测总超时 3 秒，和脚本的 timeout=3.0 一致；TCP 连接超时 1.2 秒，
      * 和脚本的 connect_timeout=1.2 一致。
+     *
+     * “Connection reset”重试一次：高并发下大量连接会被路由器/NAT 或边缘节点
+     * 以 RST 快速拒绝，这种失败通常是瞬时拥塞，等 300ms 后重试一次往往能通。
+     * 只有连接被重置才重试，其他失败（超时、HTTP 错误等）只试一次；
+     * 重试失败也只记一次失败，不重复计数。
      */
     fun probe(ip: String, baseline: String): ProbeOutcome {
+        val first = probeOnce(ip, baseline)
+        if (first is ProbeOutcome.Failure && first.reason.contains("Connection reset")) {
+            try { Thread.sleep(RETRY_DELAY_MS) } catch (e: InterruptedException) { /* ignore */ }
+            return probeOnce(ip, baseline)
+        }
+        return first
+    }
+
+    /** 单次探测（不重试）。 */
+    private fun probeOnce(ip: String, baseline: String): ProbeOutcome {
         val start = System.currentTimeMillis()
         val deadline = start + TOTAL_TIMEOUT_MS
         var socket: SSLSocket? = null

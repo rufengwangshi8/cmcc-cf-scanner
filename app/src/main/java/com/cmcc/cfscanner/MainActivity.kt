@@ -90,7 +90,9 @@ class MainActivity : AppCompatActivity() {
                 var done = 0
                 progressBar.isIndeterminate = false
                 progressBar.max = ips.size
-                for (chunk in ips.chunked(100)) {
+                // 并发 30：100 并发时大量 TLS 握手会被路由器/NAT 或边缘节点
+                // 以 RST 快速拒绝（实测失败率 70%），降并发能缓解。
+                for (chunk in ips.chunked(30)) {
                     val probed = chunk.map { ip ->
                         async(Dispatchers.IO) { Scanner.probe(ip, baseline) }
                     }.awaitAll()
